@@ -10,6 +10,7 @@ import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
+import android.os.Bundle
 import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.view.ContextThemeWrapper
@@ -36,6 +37,7 @@ import com.babenko.rescueservice.core.HighlightElementEvent
 import com.babenko.rescueservice.core.ProcessingStateChanged
 import com.babenko.rescueservice.core.ScrollEvent
 import com.babenko.rescueservice.core.TtsPlaybackFinished
+import com.babenko.rescueservice.core.InputTextEvent
 import com.babenko.rescueservice.voice.CommandReceiver
 import com.babenko.rescueservice.voice.ConversationManager
 import kotlinx.coroutines.CoroutineScope
@@ -58,6 +60,13 @@ class RedHelperAccessibilityService : AccessibilityService() {
     private var lastScreenHash: String? = null
     private var followUpSentInThisWindow: Boolean = false
     private var wasWindowActive: Boolean = false
+
+    // Флаг последнего действия: true, если последний клик/скролл явно не сработал
+    private var lastActionFailed: Boolean = false
+
+    // Счётчик подряд идущих фейлов по одному и тому же селектору
+    private var consecutiveElementNotFound: Int = 0
+    private var lastFailedSelectorKey: String? = null
 
     // --- Debounce Runnable ---
     private var debounceRunnable: Runnable? = null
@@ -128,7 +137,7 @@ class RedHelperAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() {}
 
-    override fun onUnbind(intent: android.content.Intent?): Boolean {
+    override fun onUnbind(intent: Intent?): Boolean {
         removeFloatingButtonSafely()
         return super.onUnbind(intent)
     }
@@ -138,11 +147,15 @@ class RedHelperAccessibilityService : AccessibilityService() {
         removeFloatingButtonSafely()
         try {
             unregisterReceiver(localeChangeReceiver)
-        } catch (e: Exception) { Logger.e(e, "Error unregistering locale receiver") }
+        } catch (e: Exception) {
+            Logger.e(e, "Error unregistering locale receiver")
+        }
 
         try {
             unregisterReceiver(forceCaptureReceiver)
-        } catch (e: Exception) { Logger.e(e, "Error unregistering force capture receiver") }
+        } catch (e: Exception) {
+            Logger.e(e, "Error unregistering force capture receiver")
+        }
 
         super.onDestroy()
     }
@@ -285,7 +298,7 @@ class RedHelperAccessibilityService : AccessibilityService() {
 
         val screenContext = getScreenContext(rootInActiveWindow)
 
-        updateLocalizedContext() // <-- НОВАЯ СТРОКА: Принудительное обновление контекста перед использованием
+        updateLocalizedContext() // Принудительное обновление контекста перед использованием
 
         try {
             val settings = SettingsManager.getInstance(this)
@@ -371,6 +384,14 @@ class RedHelperAccessibilityService : AccessibilityService() {
 
     // NEW: Method to force screen capture and sending FOLLOW_UP, ignoring hash check
     private fun forceCapture() {
+        // Если последнее действие явно провалилось (элемент не найден / скролл невозможен),
+        // считаем, что экран не изменился и FOLLOW_UP не нужен.
+        if (lastActionFailed) {
+            Logger.d("Force capture skipped: last action failed, screen likely unchanged.")
+            lastActionFailed = false
+            return
+        }
+
         // Cancel pending debounce to avoid double sending
         debounceRunnable?.let { handler.removeCallbacks(it) }
 
@@ -461,12 +482,14 @@ class RedHelperAccessibilityService : AccessibilityService() {
                     when (event) {
                         is HighlightElementEvent -> handleHighlightEvent(event)
                         is ClickElementEvent -> {
-                            // Reset flag to allow follow-up after screen change
+                            // Reset flag to allow follow-up после новой попытки
                             followUpSentInThisWindow = false
+                            lastActionFailed = false
                             handleClickEvent(event)
                         }
                         is GlobalActionEvent -> {
                             followUpSentInThisWindow = false
+                            lastActionFailed = false
                             Logger.d("Performing global action: ${event.actionId}")
                             performGlobalAction(event.actionId)
                         }
@@ -474,10 +497,17 @@ class RedHelperAccessibilityService : AccessibilityService() {
                             // Not handled in this service
                         }
                         is ScrollEvent -> {
-                            // Reset flag to allow follow-up after screen change
+                            // Reset flag to allow follow-up после новой попытки
                             followUpSentInThisWindow = false
+                            lastActionFailed = false
                             Logger.d("Received ScrollEvent: ${event.direction}")
                             performScroll(event.direction)
+                        }
+                        is InputTextEvent -> {
+                            followUpSentInThisWindow = false
+                            lastActionFailed = false
+                            Logger.d("Received InputTextEvent: '${event.text}'")
+                            handleInputText(event)
                         }
                         is ProcessingStateChanged -> {
                             Logger.d("Processing state changed: ${event.isProcessing}")
@@ -497,6 +527,8 @@ class RedHelperAccessibilityService : AccessibilityService() {
 
         if (by == null || value == null) {
             Logger.d("Click event failed: selector is null")
+            // селектор некорректен – считаем действие неуспешным
+            lastActionFailed = true
             return
         }
 
@@ -526,10 +558,70 @@ class RedHelperAccessibilityService : AccessibilityService() {
             Logger.d("Performing click on element with selector: $selector")
             targetNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             targetNode.recycle()
+            // успешный клик – сбрасываем флаги и счётчик фейлов
+            lastActionFailed = false
+            consecutiveElementNotFound = 0
+            lastFailedSelectorKey = null
         } else {
             Logger.d("Could not find element to click with selector: $selector")
-            // Inform user via TTS if element is not found
-            TtsManager.speak(this, "Я не вижу элемент $value", TextToSpeech.QUEUE_ADD)
+            // Явный фэйл: элемента нет
+            lastActionFailed = true
+
+            // Ключ селектора – чтобы отличать разные элементы
+            val key = selector.toString()
+            if (lastFailedSelectorKey == key) {
+                consecutiveElementNotFound++
+            } else {
+                lastFailedSelectorKey = key
+                consecutiveElementNotFound = 1
+            }
+
+            if (consecutiveElementNotFound >= 3) {
+                // Достигли лимита – говорим, что задача неудачна, и сбрасываем состояние счётчика
+                consecutiveElementNotFound = 0
+                lastFailedSelectorKey = null
+
+                TtsManager.speak(
+                    this,
+                    "Я так и не нашёл элемент $value. Давай попробуем по-другому — скажи, что открыть или куда нажать.",
+                    TextToSpeech.QUEUE_FLUSH
+                )
+            } else {
+                // Обычная ошибка – добавляем в очередь
+                TtsManager.speak(this, "Я не вижу элемент $value", TextToSpeech.QUEUE_ADD)
+            }
+        }
+    }
+
+    private fun handleInputText(event: InputTextEvent) {
+        val root = rootInActiveWindow
+        if (root == null) {
+            Logger.d("InputTextEvent: rootInActiveWindow is null")
+            lastActionFailed = true
+            return
+        }
+
+        try {
+            val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            if (focused != null) {
+                val args = Bundle().apply {
+                    putCharSequence(
+                        AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                        event.text
+                    )
+                }
+                val ok = focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                Logger.d("InputTextEvent: setText='${event.text}', success=$ok")
+                lastActionFailed = !ok
+                focused.recycle()
+            } else {
+                Logger.d("InputTextEvent: no focused input field found")
+                lastActionFailed = true
+                TtsManager.speak(this, "Я не вижу, куда ввести текст", TextToSpeech.QUEUE_ADD)
+            }
+        } catch (e: Exception) {
+            Logger.e(e, "Error handling InputTextEvent")
+            lastActionFailed = true
         }
     }
 
@@ -557,8 +649,12 @@ class RedHelperAccessibilityService : AccessibilityService() {
             Logger.d("Scrolling $direction on node: ${scrollable.viewIdResourceName}")
             scrollable.performAction(action)
             scrollable.recycle()
+            // скролл прошёл – считаем успешным действием
+            lastActionFailed = false
         } else {
             Logger.d("No scrollable node found")
+            // скроллить некуда – считаем неудачным действием
+            lastActionFailed = true
             TtsManager.speak(this, "Здесь нельзя прокрутить", TextToSpeech.QUEUE_ADD)
         }
 

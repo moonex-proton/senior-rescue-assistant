@@ -38,6 +38,9 @@ class VoiceSessionService : Service() {
         private const val EXTRA_SCREEN_CONTEXT = "EXTRA_SCREEN_CONTEXT"
         private const val TTS_HANDOFF_DELAY_MS = 300 // previously used SR→TTS delay
 
+        // НОВАЯ СТРОКА: Уникальный экшен для команды перезапуска прослушивания
+        const val ACTION_RESTART_LISTENING = "com.babenko.rescueservice.ACTION_RESTART_LISTENING"
+
         /**
          * Public API for starting an SR session.
          */
@@ -79,6 +82,7 @@ class VoiceSessionService : Service() {
         }
 
         override fun onRmsChanged(rmsdB: Float) {}
+
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEndOfSpeech() {
             Logger.d("onEndOfSpeech")
@@ -98,6 +102,7 @@ class VoiceSessionService : Service() {
                 else -> "Unknown speech recognizer error"
             }
             Logger.d("onError: $errorMessage")
+
             // On any error, send an empty result
             processCommand("")
         }
@@ -105,7 +110,7 @@ class VoiceSessionService : Service() {
         override fun onResults(results: Bundle?) {
             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             if (!matches.isNullOrEmpty()) {
-                // Combine all matches with a delimiter to let CommandParser check them all
+                // Combine all matches with a delimiter to let CommandParser check them
                 val combinedText = matches.joinToString(" ||| ")
                 Logger.d("onResults (all): $combinedText")
                 processCommand(combinedText)
@@ -154,6 +159,24 @@ class VoiceSessionService : Service() {
             return START_NOT_STICKY
         }
         startForegroundServiceWithNotification()
+
+        // НОВЫЙ БЛОК: Обработка команды перезапуска (ACTION_RESTART_LISTENING)
+        if (intent?.action == ACTION_RESTART_LISTENING) {
+            Logger.d("onStartCommand: Received ACTION_RESTART_LISTENING (Dialogue mode).")
+            // Отменяем таймер сессии, чтобы он не прервал диалог, пока пользователь думает.
+            handler.removeCallbacks(stopRunnable)
+
+            // Начинаем прослушивание с небольшой задержкой, чтобы TTS успел договорить вопрос LLM.
+            handler.postDelayed({
+                // Закрываем окно наблюдения, если оно было активно, чтобы SR не прервался.
+                AssistantLifecycleManager.cancelFollowUpWindow()
+                startListening()
+            }, TTS_HANDOFF_DELAY_MS.toLong())
+
+            return START_NOT_STICKY
+        }
+
+        // СТАРЫЙ БЛОК (для обычного запуска через startSession):
         val timeout = intent?.getIntExtra(EXTRA_SESSION_TIMEOUT_SECONDS, 15) ?: 15
         handler.postDelayed(stopRunnable, timeout * 1000L)
         handler.postDelayed({

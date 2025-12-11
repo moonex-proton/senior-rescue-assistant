@@ -53,9 +53,13 @@ object ConversationManager {
     private var isRetryAttempt = false
     private val settings: SettingsManager by lazy { SettingsManager.getInstance(appContext) }
 
+    // НОВАЯ СТРОКА: Кэш списка установленных приложений
+    private var installedAppsCache: String? = null
+
     fun init(context: Context) {
         appContext = context.applicationContext
         Logger.d("ConversationManager initialized")
+
     }
 
     fun startFirstRunSetup() {
@@ -117,8 +121,11 @@ object ConversationManager {
                 // --- FUSE PROTECTION (Client-side) ---
                 if (currentTaskState.goal != "NONE" && currentTaskState.step > 5) {
                     Logger.d("Fuse triggered: Step limit > 5. Stopping task.")
+
                     // Reset state
                     currentTaskState = TaskState()
+                    // NEW: Сброс кэша при аварийной остановке
+                    installedAppsCache = null
 
                     // Inform user
                     val msg = "Я искала слишком долго, но не нашла. Давайте попробуем иначе."
@@ -262,6 +269,7 @@ object ConversationManager {
             TtsManager.speak(appContext, phrase, TextToSpeech.QUEUE_ADD, onDone = {
                 scope.launch { EventBus.post(ProcessingStateChanged(false)) }
             })
+
             resetToIdle()
         } else {
             if (!isRetryAttempt) {
@@ -338,6 +346,8 @@ object ConversationManager {
         isRetryAttempt = false
         // --- RESETTING THE SESSION ---
         currentSessionId = null
+        // НОВАЯ СТРОКА: Сброс кэша приложений при сбросе сессии
+        installedAppsCache = null
         Logger.d("ConversationManager state and session reset to IDLE.")
         // --- CHANGE: Always ensure green state on reset ---
         scope.launch { EventBus.post(ProcessingStateChanged(false)) }
@@ -435,7 +445,7 @@ object ConversationManager {
                 scheduleForceCapture()
                 onComplete()
             }
-            // --- APP LAUNCH COMMANDS ---
+            // --- APP LAUNCH COMMANDS -- -
             Command.OPEN_APP -> {
                 val appNameQuery = parsed.payload
                 if (!appNameQuery.isNullOrBlank()) {
@@ -559,13 +569,17 @@ object ConversationManager {
 
         val currentLangCode = settings.getLanguage()
         val message = if (currentLangCode.startsWith("ru", ignoreCase = true)) {
-            "Я всё настроила. Вас зовут: $finalName. Язык общения: $languageName. Скорость речи: $speedDesc. " +
-            "И последнее: когда кнопка зелёная — можно нажимать и говорить. Если она красная — я работаю, нужно немного подождать. " +
-            "Если я понадоблюсь, просто нажмите на зелёную кнопку на экране."
+            "Я всё настроила. " +
+                    "Вас зовут: $finalName. Язык общения: $languageName. Скорость речи: $speedDesc. " +
+                    "И последнее: когда кнопка зелёная — можно нажимать и говорить. " +
+                    "Если она красная — я работаю, нужно немного подождать. " +
+                    "Если я понадоблюсь, просто нажмите на зелёную кнопку на экране."
         } else {
-            "I've set everything up. I will call you: $finalName. Language: $languageName. Speech rate: $speedDesc. " +
-            "One last thing: when the button is green, you can press and speak. If it is red, I am working, please wait a moment. " +
-            "If you need me, just press the green button on the screen."
+            "I've set everything up. " +
+                    "I will call you: $finalName. Language: $languageName. Speech rate: $speedDesc. " +
+                    "One last thing: when the button is green, you can press and speak. " +
+                    "If it is red, I am working, please wait a moment. " +
+                    "If you need me, just press the green button on the screen."
         }
 
         TtsManager.speak(context, message, TextToSpeech.QUEUE_ADD, onDone = {
@@ -596,8 +610,7 @@ object ConversationManager {
         SettingsManager.updateContext(appContext)
         settings.loadSettings()
 
-        // Send a broadcast to notify other components (like the Accessibility
-        // Service)
+        // Send a broadcast to notify other components (like the Accessibility Service)
         val intent = Intent(ACTION_LOCALE_CHANGED)
         appContext.sendBroadcast(intent)
         Logger.d("Sent broadcast for locale change.")
@@ -674,20 +687,38 @@ object ConversationManager {
         val batteryPct = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
         val isLocked = km.isKeyguardLocked
 
-        // --- НОВАЯ СТРОКА: Получаем список приложений ---
-        val appsList = getInstalledAppsList(appContext)
+        // --- ИЗМЕНЕННАЯ ЛОГИКА: Получаем список приложений (с кэшированием) ---
+        // Если это Шаг 0 (currentSessionId == null) или кэш сброшен (например, после stop_task),
+        // собираем полный список и отправляем его, кэшируя для будущих шагов.
+        // Иначе отправляем null, чтобы бэкенд не тратил токены.
+        val appsList: String? = if (currentSessionId == null || installedAppsCache == null) {
+            getInstalledAppsList(appContext).also { installedAppsCache = it }
+        } else {
+            null
+        }
 
         return DeviceStatus(
             is_airplane_mode_on = isAirplaneMode,
             internet_connection_status = connectionType,
             ringer_mode = ringerMode,
             battery_level = batteryPct,
-            installed_apps = appsList, // <--- НОВАЯ СТРОКА: Передаем список
+            installed_apps = appsList, // <--- ИЗМЕНЕНИЕ: Используем условный список
             is_keyguard_locked = isLocked
         )
     }
 
     private fun processActions(actions: List<Action>) {
+        // NEW: если LLM не использовала set_goal, но прислала debug(goal=...),
+        // и у нас пока goal == "NONE", подхватываем цель из debug.
+        val hasExplicitGoal = actions.any { it.type == "set_goal" }
+        if (!hasExplicitGoal && currentTaskState.goal == "NONE") {
+            val debugGoal = actions.firstOrNull { it.type == "debug" && it.selector.by == "goal" }?.selector?.value
+            if (!debugGoal.isNullOrBlank()) {
+                currentTaskState = TaskState(goal = debugGoal, step = 0)
+                Logger.d("GOAL INFERRED FROM DEBUG: $debugGoal")
+            }
+        }
+
         scope.launch {
             for (action in actions) {
                 try {
@@ -699,7 +730,20 @@ object ConversationManager {
                         }
                         "stop_task" -> {
                             currentTaskState = TaskState() // Reset to NONE
-                            Logger.d("TASK STOPPED by LLM.")
+                            // НОВАЯ СТРОКА: Сброс кэша приложений при завершении задачи
+                            installedAppsCache = null
+                            Logger.d("TASK STOPPED by LLM. App cache reset.")
+                        }
+                        // НОВЫЙ БЛОК: Обработка команды уточнения
+                        "ask_user" -> {
+                            // LLM задала вопрос, нужно включить микрофон сразу после TTS
+                            // Отправка интента в VoiceSessionService для перезапуска прослушивания.
+                            // Константа ACTION_RESTART_LISTENING будет добавлена в VoiceSessionService.
+                            val intent = Intent(VoiceSessionService.ACTION_RESTART_LISTENING)
+                            appContext.sendBroadcast(intent)
+                            Logger.d("DIALOGUE: ask_user command received. Broadcasting ACTION_RESTART_LISTENING.")
+                            // Прерываем дальнейшую обработку действий, так как ask_user является завершающим шагом в текущем цикле.
+                            return@launch
                         }
                         "click" -> {
                             val selectorMap = mapOf("by" to action.selector.by, "value" to action.selector.value)
@@ -726,6 +770,12 @@ object ConversationManager {
                             val direction = action.selector.value
                             Log.d("ConvManager", "Posting scroll event: $direction")
                             EventBus.post(ScrollEvent(direction))
+                            scheduleForceCapture()
+                        }
+                        "input_text" -> {
+                            val text = action.selector.value
+                            Log.d("ConvManager", "Posting input_text event: '$text'")
+                            EventBus.post(InputTextEvent(text))
                             scheduleForceCapture()
                         }
                     }
