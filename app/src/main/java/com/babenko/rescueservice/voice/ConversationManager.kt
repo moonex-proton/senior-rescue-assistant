@@ -101,6 +101,11 @@ object ConversationManager {
             val primaryText = text.split("|||").first().trim()
             // Если команда не распознана, выполните запрос LLM.
             if (primaryText.isNotBlank()) {
+                // --- NEW: Force new session for new orders ---
+                if (currentTaskState.goal == "NONE") {
+                    currentSessionId = null
+                    installedAppsCache = null
+                }
                 Logger.d("CONV-DEBUG-A: Command UNKNOWN. Calling queryLlm with: ${primaryText.take(50)}")
                 queryLlm(primaryText, screenContext)
             }
@@ -119,13 +124,15 @@ object ConversationManager {
                 Logger.d("CONV-DEBUG-B: Entered queryLlm coroutine.")
                 EventBus.post(ProcessingStateChanged(true))
                 // --- FUSE PROTECTION (Client-side) ---
-                if (currentTaskState.goal != "NONE" && currentTaskState.step > 5) {
-                    Logger.d("Fuse triggered: Step limit > 5. Stopping task.")
+                if (currentTaskState.goal != "NONE" && currentTaskState.step > 10) {
+                    Logger.d("Fuse triggered: Step limit > 10. Stopping task.")
 
                     // Reset state
                     currentTaskState = TaskState()
                     // NEW: Сброс кэша при аварийной остановке
                     installedAppsCache = null
+                    // NEW: Сброс сессии при аварийной остановке
+                    currentSessionId = null
 
                     // Inform user
                     val msg = "Я искала слишком долго, но не нашла. Давайте попробуем иначе."
@@ -200,6 +207,8 @@ object ConversationManager {
 
             } catch (e: Exception) {
                 Logger.e(e, "Failed to get response from LLM.")
+                // Reset session on error to prevent stuck state
+                currentSessionId = null
                 // --- DEBUG E: Log the end of error handling ---
                 Logger.d("CONV-DEBUG-E: Handled LLM failure.")
                 val fallbackMessage = appContext.getString(R.string.llm_error_fallback)
@@ -396,7 +405,7 @@ object ConversationManager {
         }, 500)
     }
 
-    // CHANGE: Update signature to accept original text and screen context for fallback
+    // CHANGE: Updated logic to return pair (Success, Remainder) and handle complex queries
     private fun processLocalCommand(parsed: ParsedCommand, originalText: String? = null, screenContext: String? = null) {
         // --- CHANGE: Set red state during command processing ---
         scope.launch { EventBus.post(ProcessingStateChanged(true)) }
@@ -732,7 +741,8 @@ object ConversationManager {
                             currentTaskState = TaskState() // Reset to NONE
                             // НОВАЯ СТРОКА: Сброс кэша приложений при завершении задачи
                             installedAppsCache = null
-                            Logger.d("TASK STOPPED by LLM. App cache reset.")
+                            currentSessionId = null
+                            Logger.d("TASK STOPPED by LLM. Session and App cache reset.")
                         }
                         // НОВЫЙ БЛОК: Обработка команды уточнения
                         "ask_user" -> {

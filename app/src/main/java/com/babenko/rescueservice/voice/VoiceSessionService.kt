@@ -200,16 +200,20 @@ class VoiceSessionService : Service() {
     }
 
     private fun startListening() {
-        val language = settingsManager.getLanguage()
+        val currentLang = settingsManager.getLanguage()
+        // Determine the secondary language for command recognition (switching language)
+        val otherLang = if (currentLang.startsWith("ru", ignoreCase = true)) "en-US" else "ru-RU"
+
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
-            // Removed EXTRA_ADDITIONAL_LANGUAGES to enforce strict language mode.
-            // Request multiple results to improve command detection even in strict mode.
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, currentLang)
+            // Restore dual-language support to allow "Switch language" commands in the target language
+            // Using literal string key to avoid compilation issues on older SDKs/IDE configurations
+            putExtra("android.speech.extra.ADDITIONAL_LANGUAGES", arrayOf(otherLang))
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
         }
         speechRecognizer?.startListening(intent)
-        Logger.d("startListening called for language $language (strict mode)")
+        Logger.d("startListening: Primary=$currentLang, Secondary=$otherLang")
     }
 
     /**
