@@ -42,7 +42,7 @@ class VoiceSessionService : Service() {
         const val ACTION_RESTART_LISTENING = "com.babenko.rescueservice.ACTION_RESTART_LISTENING"
 
         /**
-         * Public API for starting an SR session.
+         * Public API for startSession.
          */
         fun startSession(
             context: Context,
@@ -111,6 +111,7 @@ class VoiceSessionService : Service() {
             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             if (!matches.isNullOrEmpty()) {
                 // Combine all matches with a delimiter to let CommandParser check them
+                // FIXED: Removed newline break in the string delimiter
                 val combinedText = matches.joinToString(" ||| ")
                 Logger.d("onResults (all): $combinedText")
                 processCommand(combinedText)
@@ -145,6 +146,11 @@ class VoiceSessionService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Logger.d("VoiceSessionService started")
+
+        // CRITICAL FIX: Reload settings from disk to ensure we have the latest language
+        // synced from the main process (which used commit()).
+        settingsManager.loadSettings()
+
         currentScreenContext = intent?.getStringExtra(EXTRA_SCREEN_CONTEXT)
         Logger.d("Service started with context: ${currentScreenContext != null}")
 
@@ -200,6 +206,7 @@ class VoiceSessionService : Service() {
     }
 
     private fun startListening() {
+        // Now getting the language directly from settingsManager, which is fresh after loadSettings()
         val currentLang = settingsManager.getLanguage()
         // Determine the secondary language for command recognition (switching language)
         val otherLang = if (currentLang.startsWith("ru", ignoreCase = true)) "en-US" else "ru-RU"

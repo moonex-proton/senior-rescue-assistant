@@ -28,12 +28,14 @@ class SettingsManager private constructor(private var context: Context) {
 
     // --- Language ---
     fun saveLanguage(language: String) {
-        prefs.edit().putString(KEY_LANGUAGE, language).apply()
+        // CHANGED: used commit() instead of apply() to ensure the data is written to disk
+        // synchronously before we attempt to read it in the :voice process.
+        prefs.edit().putString(KEY_LANGUAGE, language).commit()
     }
 
     fun getLanguage(): String {
-        // Reload before reading to get the latest value from other processes.
-        loadSettings()
+        // Removed explicit loadSettings() to prevent reading stale data from disk
+        // immediately after an async save. The in-memory instance is up-to-date.
         return prefs.getString(KEY_LANGUAGE, DEFAULT_LANGUAGE) ?: DEFAULT_LANGUAGE
     }
 
@@ -52,7 +54,7 @@ class SettingsManager private constructor(private var context: Context) {
     }
 
     fun getUserName(): String {
-        loadSettings()
+        // Removed explicit loadSettings() here as well
         val storedName = prefs.getString(KEY_USER_NAME, null)
         if (storedName != null) {
             return storedName

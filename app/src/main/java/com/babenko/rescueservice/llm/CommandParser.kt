@@ -30,7 +30,6 @@ object CommandParser {
     // --- Trigger lists -- -
     // IMPORTANT: All triggers must be free of punctuation (hyphens, question marks, apostrophes),
     // because the normalize() function now strips them out.
-
     private val repeatTriggers = setOf(
         // Original
         "повтори", "repeat", "say it again", "что ты сказал", "не расслышал", "чточто", "ещё раз", // "что-что" -> "чточто"
@@ -69,16 +68,16 @@ object CommandParser {
     // --- Language Change Triggers for test ---
     private val toRussianTriggers = setOf(
         // English commands for switching to Russian
-        "change language russian", "switch language russian", "set language russian", "speak russian",
+        "change language russian", "switch language russian", "set language russian", "speak russian", "speak in russian",
         // Russian commands for switching to Russian
-        "сменить язык русский", "измени язык русский", "поставь русский", "говори русском"
+        "сменить язык русский", "измени язык русский", "поставь русский", "говори русском", "говори на русском"
     )
 
     private val toEnglishTriggers = setOf(
         // English commands for switching to English
-        "change language english", "switch language english", "set language english", "speak english",
+        "change language english", "switch language english", "set language english", "speak english", "speak in english",
         // Russian commands for switching to English
-        "сменить язык английский", "измени язык английский", "поставь английский", "говори английском"
+        "сменить язык английский", "измени язык английский", "поставь английский", "говори английском", "говори на английском"
     )
 
     private val speechRateFasterTriggers = setOf(
@@ -119,6 +118,7 @@ object CommandParser {
     fun parse(text: String): ParsedCommand {
         // Split by the delimiter we use in VoiceSessionService
         val variants = text.split(" ||| ")
+        android.util.Log.d("CommandParser", "PARSE: Input='$text', SplitSize=${variants.size}")
 
         for (variant in variants) {
             val lowercasedText = variant.lowercase()
