@@ -24,21 +24,7 @@ import com.babenko.rescueservice.data.SettingsManager
 import com.babenko.rescueservice.core.AssistantLifecycleManager
 
 /**
- * Production-grade VoiceSessionService.
- *
- * Key behaviors:
- * - Runs short SR session as a foreground service.
- * - Honors SettingsManager.isStrictRecognitionEnabled(): when strict -> force EXTRA_LANGUAGE;
- *   when non-strict -> allow SR engine to auto-detect language.
- * - Single fallback attempt with alternative locale (en <-> ru) on NO_MATCH / TIMEOUT / empty results.
- * - Supports ACTION_RESTART_LISTENING: ConversationManager (or any main-process component) can send
- *   an intent with this action to request the running service to restart listening without recreating
- *   the service. This avoids stopping/starting the foreground service and preserves UX.
- *
- * Usage:
- * - Start a session: VoiceSessionService.startSession(context, timeoutSeconds, screenContext)
- * - Request restart of listening in the running service: send Intent with action = ACTION_RESTART_LISTENING
- *   targeted to the service (explicit component or package).
+ * A foreground service for speech recognition, running in a separate process (:voice).
  */
 class VoiceSessionService : Service() {
     private lateinit var settingsManager: SettingsManager
@@ -46,23 +32,17 @@ class VoiceSessionService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var currentScreenContext: String? = null
 
-    // Session timeout in milliseconds (set on start)
-    private var sessionTimeoutMs: Long = 15_000L
-
-    // Fallback control: allow a single fallback attempt per session
-    private var triedFallback: Boolean = false
-
     companion object {
         private const val NOTIFICATION_ID = 101
         private const val EXTRA_SESSION_TIMEOUT_SECONDS = "EXTRA_SESSION_TIMEOUT_SECONDS"
         private const val EXTRA_SCREEN_CONTEXT = "EXTRA_SCREEN_CONTEXT"
         private const val TTS_HANDOFF_DELAY_MS = 300 // previously used SR→TTS delay
 
-        // Public action used by other processes to restart listening in the running service
+        // НОВАЯ СТРОКА: Уникальный экшен для команды перезапуска прослушивания
         const val ACTION_RESTART_LISTENING = "com.babenko.rescueservice.ACTION_RESTART_LISTENING"
 
         /**
-         * Public API for starting an SR session.
+         * Public API for startSession.
          */
         fun startSession(
             context: Context,
@@ -102,6 +82,7 @@ class VoiceSessionService : Service() {
         }
 
         override fun onRmsChanged(rmsdB: Float) {}
+
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEndOfSpeech() {
             Logger.d("onEndOfSpeech")
@@ -120,45 +101,23 @@ class VoiceSessionService : Service() {
                 SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech input"
                 else -> "Unknown speech recognizer error"
             }
-            Logger.d("onError: $errorMessage (code=$error)")
+            Logger.d("onError: $errorMessage")
 
-            // If recoverable (no-match / timeout) and we haven't tried fallback -> attempt fallback
-            if (!triedFallback && (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)) {
-                triedFallback = true
-                val alt = alternativeLanguage()
-                Logger.d("Recoverable error - attempting fallback recognition with locale: $alt")
-                // Reset session timeout for fallback attempt
-                handler.removeCallbacks(stopRunnable)
-                handler.postDelayed(stopRunnable, sessionTimeoutMs)
-                startFallbackListening(alt)
-                return
-            }
-
-            // Otherwise send empty result
+            // On any error, send an empty result
             processCommand("")
         }
 
         override fun onResults(results: Bundle?) {
             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             if (!matches.isNullOrEmpty()) {
-                // Combine all matches with a delimiter (VoiceSessionService uses this format)
+                // Combine all matches with a delimiter to let CommandParser check them
+                // FIXED: Removed newline break in the string delimiter
                 val combinedText = matches.joinToString(" ||| ")
                 Logger.d("onResults (all): $combinedText")
                 processCommand(combinedText)
             } else {
-                Logger.d("onResults: empty matches")
-                // Try a single fallback if available
-                if (!triedFallback) {
-                    triedFallback = true
-                    val alt = alternativeLanguage()
-                    Logger.d("Empty results — attempting fallback SR with locale $alt")
-                    handler.removeCallbacks(stopRunnable)
-                    handler.postDelayed(stopRunnable, sessionTimeoutMs)
-                    startFallbackListening(alt)
-                } else {
-                    Logger.d("No matches after fallback. Sending empty command.")
-                    processCommand("")
-                }
+                Logger.d("onResults: No matches found.")
+                processCommand("")
             }
         }
 
@@ -170,49 +129,30 @@ class VoiceSessionService : Service() {
         super.onCreate()
         Logger.d("VoiceSessionService created")
         settingsManager = SettingsManager.getInstance(this)
-        initSpeechRecognizerIfNeeded()
-    }
-
-    private fun initSpeechRecognizerIfNeeded() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             Logger.e(Exception("SpeechRecognizer not available on this device."))
             speechRecognizer = null
             return
         }
-        if (speechRecognizer == null) {
-            try {
-                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
-                speechRecognizer?.setRecognitionListener(recognitionListener)
-                Logger.d("SpeechRecognizer created successfully in initSpeechRecognizerIfNeeded.")
-            } catch (e: Exception) {
-                Logger.e(e, "Failed to create SpeechRecognizer")
-                speechRecognizer = null
-            }
+        try {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+            speechRecognizer?.setRecognitionListener(recognitionListener)
+            Logger.d("SpeechRecognizer created successfully.")
+        } catch (e: Exception) {
+            Logger.e(e, "Failed to create SpeechRecognizer in onCreate.")
+            speechRecognizer = null
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Logger.d("VoiceSessionService started (intent action=${intent?.action})")
+        Logger.d("VoiceSessionService started")
+
+        // CRITICAL FIX: Reload settings from disk to ensure we have the latest language
+        // synced from the main process (which used commit()).
+        settingsManager.loadSettings()
+
         currentScreenContext = intent?.getStringExtra(EXTRA_SCREEN_CONTEXT)
-        Logger.d("Service started with context present=${currentScreenContext != null}")
-
-        // Ensure speech recognizer exists (handle case where service already running but SR was destroyed)
-        initSpeechRecognizerIfNeeded()
-
-        // Handle explicit restart-listening requests
-        if (intent?.action == ACTION_RESTART_LISTENING) {
-            Logger.d("Received ACTION_RESTART_LISTENING — restarting listening in existing service")
-            // Reset fallback flag for new listening attempt
-            triedFallback = false
-            // Reset / extend session timeout
-            val timeout = intent.getIntExtra(EXTRA_SESSION_TIMEOUT_SECONDS, (sessionTimeoutMs / 1000L).toInt())
-            sessionTimeoutMs = timeout * 1000L
-            handler.removeCallbacks(stopRunnable)
-            handler.postDelayed(stopRunnable, sessionTimeoutMs)
-            // start listening afresh
-            startListening()
-            return START_NOT_STICKY
-        }
+        Logger.d("Service started with context: ${currentScreenContext != null}")
 
         if (speechRecognizer == null) {
             Logger.e(Exception("SpeechRecognizer was not created or is not available. Stopping service."))
@@ -224,21 +164,32 @@ class VoiceSessionService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-
-        // Default startSession flow
         startForegroundServiceWithNotification()
+
+        // НОВЫЙ БЛОК: Обработка команды перезапуска (ACTION_RESTART_LISTENING)
+        if (intent?.action == ACTION_RESTART_LISTENING) {
+            Logger.d("onStartCommand: Received ACTION_RESTART_LISTENING (Dialogue mode).")
+            // Отменяем таймер сессии, чтобы он не прервал диалог, пока пользователь думает.
+            handler.removeCallbacks(stopRunnable)
+
+            // Начинаем прослушивание с небольшой задержкой, чтобы TTS успел договорить вопрос LLM.
+            handler.postDelayed({
+                // Закрываем окно наблюдения, если оно было активно, чтобы SR не прервался.
+                AssistantLifecycleManager.cancelFollowUpWindow()
+                startListening()
+            }, TTS_HANDOFF_DELAY_MS.toLong())
+
+            return START_NOT_STICKY
+        }
+
+        // СТАРЫЙ БЛОК (для обычного запуска через startSession):
         val timeout = intent?.getIntExtra(EXTRA_SESSION_TIMEOUT_SECONDS, 15) ?: 15
-        sessionTimeoutMs = timeout * 1000L
-
-        // Reset fallback flag for this session
-        triedFallback = false
-
-        handler.postDelayed(stopRunnable, sessionTimeoutMs)
+        handler.postDelayed(stopRunnable, timeout * 1000L)
         handler.postDelayed({
+            // Close the follow-up window before starting the voice session
             AssistantLifecycleManager.cancelFollowUpWindow()
             startListening()
         }, 500)
-
         return START_NOT_STICKY
     }
 
@@ -255,74 +206,34 @@ class VoiceSessionService : Service() {
     }
 
     private fun startListening() {
-        val language = settingsManager.getLanguage()
-        val strictSR = settingsManager.isStrictRecognitionEnabled()
+        // Now getting the language directly from settingsManager, which is fresh after loadSettings()
+        val currentLang = settingsManager.getLanguage()
+        // Determine the secondary language for command recognition (switching language)
+        val otherLang = if (currentLang.startsWith("ru", ignoreCase = true)) "en-US" else "ru-RU"
 
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            if (strictSR) {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
-                Logger.d("startListening: forcing SR language $language")
-            } else {
-                Logger.d("startListening: strict SR disabled -> allowing auto language detection")
-            }
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, currentLang)
+            // Restore dual-language support to allow "Switch language" commands in the target language
+            // Using literal string key to avoid compilation issues on older SDKs/IDE configurations
+            putExtra("android.speech.extra.ADDITIONAL_LANGUAGES", arrayOf(otherLang))
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         }
-
-        try {
-            speechRecognizer?.cancel()
-            speechRecognizer?.startListening(intent)
-            Logger.d("startListening called (strictSR=$strictSR) for language $language")
-        } catch (e: Exception) {
-            Logger.e(e, "Failed to start listening")
-            processCommand("")
-        }
+        speechRecognizer?.startListening(intent)
+        Logger.d("startListening: Primary=$currentLang, Secondary=$otherLang")
     }
 
     /**
-     * Start a single fallback recognition attempt with a specific locale.
-     * Caller should set triedFallback = true before calling to avoid loops.
-     */
-    private fun startFallbackListening(locale: String) {
-        Logger.d("startFallbackListening: requesting SR with locale $locale")
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, locale)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-        }
-
-        try {
-            speechRecognizer?.cancel()
-            speechRecognizer?.startListening(intent)
-            Logger.d("Fallback recognition started for locale $locale")
-        } catch (e: Exception) {
-            Logger.e(e, "Failed to start fallback listening for locale $locale")
-            processCommand("")
-        }
-    }
-
-    private fun alternativeLanguage(): String {
-        val current = settingsManager.getLanguage()
-        return if (current.startsWith("en", ignoreCase = true) || current.startsWith("en")) "ru-RU" else "en-US"
-    }
-
-    /**
-     * Finish SR and pass the text to the main process.
+     * Finishes SR and passes the text to the main process WITHOUT delay.
+     * We use an explicit broadcast to CommandReceiver in the main process.
      */
     private fun processCommand(text: String) {
         handler.removeCallbacks(stopRunnable)
-        // Stop and destroy recognizer (service is short-lived)
-        try {
-            speechRecognizer?.stopListening()
-        } catch (_: Throwable) { }
-        try {
-            speechRecognizer?.destroy()
-        } catch (_: Throwable) { }
+        // 1) Correctly finish SR
+        speechRecognizer?.stopListening()
+        speechRecognizer?.destroy()
         speechRecognizer = null
-
-        // Broadcast to CommandReceiver in main process
+        // 2) EXPLICIT broadcast to the main process on CommandReceiver
         val broadcastIntent = Intent(CommandReceiver.ACTION_PROCESS_COMMAND).apply {
             component = ComponentName(this@VoiceSessionService, CommandReceiver::class.java)
             `package` = packageName
@@ -330,10 +241,9 @@ class VoiceSessionService : Service() {
             putExtra(CommandReceiver.EXTRA_RECOGNIZED_TEXT, text)
             putExtra(CommandReceiver.EXTRA_SCREEN_CONTEXT, currentScreenContext)
         }
-        Logger.d("Command recognized: '$text'. Broadcasting to CommandReceiver.")
+        Logger.d("Command recognized: '$text'. Broadcasting explicitly to CommandReceiver.")
         sendBroadcast(broadcastIntent)
-
-        // Finish service
+        // 3) Finish the service after sending
         stopSelf()
     }
 
@@ -341,12 +251,8 @@ class VoiceSessionService : Service() {
         super.onDestroy()
         handler.removeCallbacks(stopRunnable)
         if (speechRecognizer != null) {
-            try {
-                speechRecognizer?.stopListening()
-            } catch (_: Throwable) { }
-            try {
-                speechRecognizer?.destroy()
-            } catch (_: Throwable) { }
+            speechRecognizer?.stopListening()
+            speechRecognizer?.destroy()
             speechRecognizer = null
         }
         Logger.d("VoiceSessionService destroyed")
