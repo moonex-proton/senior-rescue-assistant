@@ -1,6 +1,12 @@
 package com.babenko.rescueservice.llm
 
-// Expanding the list of commands, making them more specific
+// Production-grade CommandParser:
+// - широкий набор триггеров (RU/EN), включая коллоквиализмы и вариации,
+// - гибкая нормализация (удаление пунктуации, сжатие пробелов),
+// - матч по границам слов для переключения языка и общих триггеров,
+// - сохранена логика payload extraction (для смены имени/запуска приложений и т.д.),
+// - минимальные изменения совместимости: startsWith все ещё используется там, где важен префикс.
+
 enum class Command {
     REPEAT,
     OPEN_SETTINGS,
@@ -15,49 +21,44 @@ enum class Command {
     // Scrolling commands
     SCROLL_DOWN,
     SCROLL_UP,
-    // App launch command
+    // App launch command (if present in variants)
     OPEN_APP,
     UNKNOWN
 }
 
-// New container class for the command and its associated data (payload)
 data class ParsedCommand(val command: Command, val payload: String? = null)
 
-/**
- * A parser object (singleton) for analyzing recognized text and determining the user's command.
- */
 object CommandParser {
-    // --- Trigger lists -- -
-    // IMPORTANT: All triggers must be free of punctuation (hyphens, question marks, apostrophes),
-    // because the normalize() function now strips them out.
+
+    // --- Repeat / Clarify ---
     private val repeatTriggers = setOf(
-        // Original
-        "повтори", "repeat", "say it again", "что ты сказал", "не расслышал", "чточто", "ещё раз", // "что-что" -> "чточто"
-        // New (RU)
-        "скажи ещё раз", "дубль", "я не услышал", "я не услышала", "плохо слышно", "не понял", "не поняла",
+        // Russian (many colloquial forms to improve UX for seniors)
+        "повтори", "скажи ещё раз", "скажи еще раз", "ещё раз", "еще раз", "дубль",
+        "я не услышал", "я не услышала", "плохо слышно", "не понял", "не поняла",
         "пропустил", "пропустила", "мимо ушей", "чё ты сказал", "чего сказал", "как ты сказал",
-        "как", "чё", "а", "э", "гм", "чего", "что", // Removed '?'
-        "повтори погромче", "повтори помедленнее", "повтори почётче", "давай ещё раз", "можно ещё раз", // "по-чётче" -> "почётче"
+        "как", "чё", "а", "э", "гм", "чего", "что",
+        "повтори погромче", "повтори помедленнее", "повтори по легче", "повтори по медленнее",
+        "повтори почётче", "повтори по четче", "давай ещё раз", "давай еще раз", "можно ещё раз", "можно еще раз",
         "повтори последнее", "повтори сначала",
-        // New (EN)
-        "say that again", "once more", "once again", "could you repeat", "can you repeat", "tell me again",
-        "didnt hear you", "didnt catch that", "missed that", "what did you say", "pardon", "come again", // "didn't" -> "didnt"
-        "what was that", "huh", "sorry", "eh", "say it louder", "repeat slower", "more clearly", // Removed '?'
-        "one more time", "last bit", "from the beginning"
+
+        // English
+        "repeat", "say it again", "say that again", "once more", "once again",
+        "could you repeat", "can you repeat", "tell me again",
+        "didnt hear you", "didnt catch that", "missed that", "what did you say",
+        "pardon", "come again", "what was that", "huh", "sorry", "eh",
+        "say it louder", "repeat slower", "more clearly", "one more time", "last bit", "from the beginning"
     )
 
+    // --- Settings / menu ---
     private val settingsTriggers = setOf(
-        // Original & Variations
         "настройки", "settings", "сетап", "setup", "открой настройки", "open settings",
         "app settings", "configuration", "options", "menu", "open menu", "preferences",
-        "change settings", "config",
-        // RU
-        "давай в настройки", "покажи настройки", "хочу поменять", "помоги настроить", "меню настроек",
-        "изменить параметры", "хочу изменить", "давай поправим", "зайди в настройки",
-        "открыть настройки", "параметры", "конфигурация", "установки", "опции", "меню"
+        "change settings", "config", "давай в настройки", "покажи настройки", "хочу поменять",
+        "помоги настроить", "меню настроек", "изменить параметры", "хочу изменить", "давай поправим",
+        "зайди в настройки", "открыть настройки", "параметры", "конфигурация", "установки", "опции", "меню"
     )
 
-    // New, more specific triggers
+    // --- Name changes / payload ---
     private val nameChangeTriggers = setOf(
         // Русский
         "сменить имя", "запомни имя", "измени имя", "зови меня", "меня зовут",
@@ -65,126 +66,152 @@ object CommandParser {
         "change name", "set name", "update name", "my name"
     )
 
-    // --- Language Change Triggers for test ---
+    // --- Language Change Triggers (robust) ---
+    // Covering many variations: direct, polite, short forms, hyphenated forms ("по-русски")
     private val toRussianTriggers = setOf(
         // English commands for switching to Russian
-        "change language russian", "switch language russian", "set language russian", "speak russian", "speak in russian",
-        // Russian commands for switching to Russian
-        "сменить язык русский", "измени язык русский", "поставь русский", "говори русском", "говори на русском"
+        "change language russian", "switch language russian", "set language russian", "speak russian",
+        "speak russian please", "please speak russian", "switch to russian", "make russian",
+        // Russian commands for switching to Russian (various colloquial forms)
+        "сменить язык русский", "измени язык русский", "поставь русский", "говори русском",
+        "по русски", "по-русски", "говори по русски", "говори по-русски", "пожалуйста говори по русски",
+        "пожалуйста говори по-русски", "пожалуйста по русски", "пожалуйста по-русски"
     )
 
     private val toEnglishTriggers = setOf(
         // English commands for switching to English
-        "change language english", "switch language english", "set language english", "speak english", "speak in english",
+        "change language english", "switch language english", "set language english", "speak english",
+        "speak english please", "please speak english", "switch to english", "make english",
         // Russian commands for switching to English
-        "сменить язык английский", "измени язык английский", "поставь английский", "говори английском", "говори на английском"
+        "сменить язык английский", "измени язык английский", "поставь английский", "говори английском",
+        "по английски", "по-английски", "говори по английски", "говори по-английски",
+        "пожалуйста говори по английски", "пожалуйста говори по-английски"
     )
 
+    // --- Speech rate ---
     private val speechRateFasterTriggers = setOf(
-        // Русский
-        "ускорь речь", "скорость речи", "говори быстрее",
-        // English
-        "speed up speech", "faster speech", "talk faster", "speech speed"
+        "ускорь речь", "скорость речи", "говори быстрее", "разговаривай быстрее",
+        "speed up speech", "faster speech", "talk faster", "increase speech rate"
     )
 
     private val speechRateSlowerTriggers = setOf(
-        // Русский
-        "замедли речь", "говори медленнее",
-        // English
-        "speed down speech", "slow speech", "talk slower"
+        "замедли речь", "говори медленнее", "говори помедленнее",
+        "speed down speech", "slow speech", "talk slower", "decrease speech rate"
     )
 
-    // --- Scroll Triggers ---
+    // --- Scroll ---
     private val scrollDownTriggers = setOf(
         "прокрути вниз", "листай вниз", "вниз", "ниже",
-        "scroll down", "swipe down", "down"
+        "scroll down", "swipe down", "down", "page down"
     )
 
     private val scrollUpTriggers = setOf(
         "прокрути вверх", "листай вверх", "вверх", "выше",
-        "scroll up", "swipe up", "up"
+        "scroll up", "swipe up", "up", "page up"
     )
 
-    // --- App Launch Triggers ---
-    private val openAppTriggers = setOf(
-        "открой", "запусти", "открыть", "старт", "включи",
-        "open", "launch", "start", "run"
-    )
-
+    // --- Intent triggers for settings dialogs ---
     private val intentNameTriggers = setOf("имя", "name", "change name", "измени имя")
     private val intentLanguageTriggers = setOf("язык", "language")
     private val intentSpeedTriggers = setOf("скорость", "скорость речи", "speed", "speech speed")
 
+    // --- App launch triggers (kept for compatibility / optional use) ---
+    private val openAppTriggers = setOf(
+        // Russian
+        "открой", "запусти", "открыть", "старт", "включи",
+        // English
+        "open", "launch", "start", "run",
+        // More colloquial
+        "открой приложение", "open app", "запусти приложение"
+    )
+
+    /**
+     * Parse the recognized text into a command. The input may contain several recognition
+     * hypotheses separated by " ||| " (VoiceSessionService does this).
+     */
     fun parse(text: String): ParsedCommand {
-        // Split by the delimiter we use in VoiceSessionService
+        // split alternatives returned by SR engine
         val variants = text.split(" ||| ")
-        android.util.Log.d("CommandParser", "PARSE: Input='$text', SplitSize=${variants.size}")
 
         for (variant in variants) {
             val lowercasedText = variant.lowercase()
-            // Strict sanitization: remove all punctuation, symbols (*, #), etc.
             val normalizedText = normalize(lowercasedText)
 
-            // 1. Prioritize cross-lingual language change commands
-            if (toRussianTriggers.any { normalizedText.equals(it, ignoreCase = true) }) {
+            // 1) High-priority: language change (use word-boundary matching)
+            if (toRussianTriggers.any { containsWord(normalizedText, it) }) {
                 return ParsedCommand(Command.CHANGE_LANGUAGE, "ru-RU")
             }
-            if (toEnglishTriggers.any { normalizedText.equals(it, ignoreCase = true) }) {
+            if (toEnglishTriggers.any { containsWord(normalizedText, it) }) {
                 return ParsedCommand(Command.CHANGE_LANGUAGE, "en-US")
             }
 
-            // 2. Look for commands with a payload (e.g., name change)
+            // 2) Payload commands (name change)
             extractPayload(normalizedText, nameChangeTriggers)?.let { payload ->
                 return ParsedCommand(Command.CHANGE_NAME, payload)
             }
 
-            // 2.5 Look for App Launch commands
+            // 2.5) App launch (if used) - payload extraction
             extractPayload(normalizedText, openAppTriggers)?.let { payload ->
                 return ParsedCommand(Command.OPEN_APP, payload)
             }
 
-            // 3. Look for simple commands (speech rate)
+            // 3) Speech rate
             if (containsTrigger(normalizedText, speechRateFasterTriggers)) return ParsedCommand(Command.CHANGE_SPEECH_RATE_FASTER)
             if (containsTrigger(normalizedText, speechRateSlowerTriggers)) return ParsedCommand(Command.CHANGE_SPEECH_RATE_SLOWER)
 
-            // 3.5 Look for Scroll commands
+            // 3.5) Scroll
             if (containsTrigger(normalizedText, scrollDownTriggers)) return ParsedCommand(Command.SCROLL_DOWN)
             if (containsTrigger(normalizedText, scrollUpTriggers)) return ParsedCommand(Command.SCROLL_UP)
 
-            // 4. Check for intent commands for the settings dialog
+            // 4) Intents for settings dialog
             if (containsTrigger(normalizedText, intentNameTriggers)) return ParsedCommand(Command.INTENT_CHANGE_NAME)
             if (containsTrigger(normalizedText, intentLanguageTriggers)) return ParsedCommand(Command.INTENT_CHANGE_LANGUAGE)
             if (containsTrigger(normalizedText, intentSpeedTriggers)) return ParsedCommand(Command.INTENT_CHANGE_SPEED)
 
+            // 5) Repeat
             if (containsTrigger(normalizedText, repeatTriggers)) return ParsedCommand(Command.REPEAT)
 
-            // 5. Look for the general "settings" command
+            // 6) General settings
             if (containsTrigger(normalizedText, settingsTriggers)) return ParsedCommand(Command.OPEN_SETTINGS)
         }
 
         return ParsedCommand(Command.UNKNOWN)
     }
 
+    // Normalization: remove punctuation, collapse multiple spaces, strip connectors.
     private fun normalize(text: String): String {
-        // 1. Replace known prepositions/connectors with spaces to keep words separate
+        // Replace some common connectors with spaces to keep tokens separate
         var res = text.replace(" на ", " ").replace(" to ", " ")
-        // 2. Remove ANY character that is NOT a letter, number, or whitespace.
-        // This strips *, #, ?, !, -, ', etc.
+        // Remove any character that is not a letter, number or whitespace (removes punctuation)
         res = res.replace(Regex("[^\\p{L}\\p{N}\\s]+"), "")
+        // Collapse multiple whitespace into a single space
+        res = res.replace(Regex("\\s+"), " ")
         return res.trim()
     }
 
-    private fun containsTrigger(text: String, triggers: Set<String>): Boolean {
-        return triggers.any { text.startsWith(it) }
+    // Word-boundary matcher: returns true if 'term' appears as a token or phrase at word boundaries in 'text'.
+    private fun containsWord(text: String, term: String): Boolean {
+        if (text == term) return true
+        // term may contain spaces (multi-word). Use regex with word boundaries via whitespace.
+        val pattern = Regex("(^|\\s)${Regex.escape(term)}(\\s|\$)")
+        return pattern.containsMatchIn(text)
     }
 
+    // For general triggers we allow startsWith or exact equivalence OR word-boundary containment.
+    private fun containsTrigger(text: String, triggers: Set<String>): Boolean {
+        return triggers.any { trigger ->
+            text == trigger ||
+                    text.startsWith(trigger) ||
+                    containsWord(text, trigger)
+        }
+    }
+
+    // Extract payload for prefix-like triggers: if text starts with trigger, return remainder.
     private fun extractPayload(text: String, triggers: Set<String>): String? {
         for (trigger in triggers) {
             if (text.startsWith(trigger)) {
-                val payload = text.substringAfter(trigger).trim()
-                if (payload.isNotEmpty()) {
-                    return payload
-                }
+                val payload = text.removePrefix(trigger).trim()
+                if (payload.isNotEmpty()) return payload
             }
         }
         return null
